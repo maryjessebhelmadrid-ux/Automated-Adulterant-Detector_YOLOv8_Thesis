@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(source:*)",
+      "Bash(wc:*)",
+      "Bash(/home/raspi/peppah/venv/bin/python:*)",
+      "Bash(/home/raspi/peppah/venv/bin/pip list:*)",
+      "Bash(dpkg -l:*)",
+      "Read(//proc/**)"
+    ]
+  }
+}
