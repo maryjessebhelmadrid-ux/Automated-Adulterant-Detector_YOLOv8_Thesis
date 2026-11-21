@@ -1,0 +1,1271 @@
+#!/usr/bin/env python3
+"""
+PEPPAH - Adulterant Detection UI
+Detects papaya seeds (adulterant) in black pepper samples.
+Raspberry Pi 5 + Camera Module 3 + YOLOv8 (NCNN)
+
+Setup (one-time):
+    sudo apt install -y python3-pil.imagetk
+    pip install ultralytics
+    python -c "from ultralytics import YOLO; YOLO('best.pt').export(format='ncnn')"
+
+Usage:
+    python detector_ui.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import traceback
+import queue
+import time
+import shutil
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+MODEL_DIR     = Path(__file__).parent
+PT_MODEL_PATH = MODEL_DIR / "best.pt"
+TRAINING_DIR  = MODEL_DIR / "training_data"
+
+# ---------------------------------------------------------------------------
+# Camera settings (reused from capture_image.py)
+# ---------------------------------------------------------------------------
+from picamera2 import Picamera2
+from libcamera import controls
+
+CAPTURE_RESOLUTION     = (2304, 1296)
+PREVIEW_RESOLUTION     = (640, 360)
+DETECTION_RESOLUTION   = (1152, 648)
+TILE_SIZE    = 640
+TILE_OVERLAP = 128                     # 20% overlap, 512px step
+
+MACRO_CONTROLS = {
+    "AfMode": controls.AfModeEnum.Continuous,
+    "AfRange": controls.AfRangeEnum.Macro,
+    "AfSpeed": controls.AfSpeedEnum.Fast,
+    "Sharpness": 2.5,
+    "Contrast": 1.3,
+    "Saturation": 1.4,
+    "Brightness": 0.05,
+    "NoiseReductionMode": controls.draft.NoiseReductionModeEnum.HighQuality,
+}
+
+# ---------------------------------------------------------------------------
+# Detection settings
+# ---------------------------------------------------------------------------
+# Shape segmentation — proven values for 1152×648 controlled-rig captures
+MIN_CONTOUR_AREA      = 250    # px² (≈ 18 px disc)
+MAX_CONTOUR_AREA      = 16000  # px² (≈ 143 px disc)
+WATERSHED_DIST_THRESH = 4      # px — min dist from edge to count as seed center
+
+# Shape classifier — clear-cut bands; anything between defers to YOLO's class
+AXIS_RATIO_PEPPER       = 0.68
+AXIS_RATIO_ADULTERANT   = 0.75
+CIRCULARITY_PEPPER      = 0.85 #
+CIRCULARITY_ADULTERANT  = 0.40
+
+# YOLO
+YOLO_CONF             = 0.40
+YOLO_IOU              = 0.5
+YOLO_NMS_IOU          = 0.20  # cross-tile NMS — high enough to keep adjacent seeds
+CONTAINMENT_RATIO     = 0.40  # smaller box must be < this fraction of larger to suppress
+
+FINETUNE_MIN_SAMPLES  = 5     # corrections needed before Fine-tune button enables
+FINETUNE_EPOCHS       = 30
+FINETUNE_BTN_LABEL    = "Fine-tune Model"
+
+CLASS_COLORS = {
+    "adulterant": (0, 0, 255),   # Red (BGR) - papaya seeds
+    "pepper": (0, 200, 0),       # Green (BGR) - black pepper
+}
+CLASS_IDS = {"adulterant": 0, "pepper": 1}
+
+# ---------------------------------------------------------------------------
+# Canvas / correction constants
+# ---------------------------------------------------------------------------
+CANVAS_W, CANVAS_H = 640, 480
+CANVAS_SCALE    = min(CANVAS_W / DETECTION_RESOLUTION[0], CANVAS_H / DETECTION_RESOLUTION[1])
+CANVAS_X_OFFSET = (CANVAS_W - int(DETECTION_RESOLUTION[0] * CANVAS_SCALE)) // 2
+CANVAS_Y_OFFSET = (CANVAS_H - int(DETECTION_RESOLUTION[1] * CANVAS_SCALE)) // 2
+
+# ---------------------------------------------------------------------------
+# UI colors
+# ---------------------------------------------------------------------------
+BG_DARK = "#1e1e1e"
+BG_BAR = "#2c2c2c"
+FG_WHITE = "#ffffff"
+FG_DIM = "#aaaaaa"
+GREEN = "#4CAF50"
+RED = "#f44336"
+BLUE = "#2196F3"
+ORANGE = "#FF9800"
+PURPLE = "#9C27B0"
+INACTIVE = "#555555"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Shape Detection Engine
+# ═══════════════════════════════════════════════════════════════════════════
+class ShapeDetectionEngine:
+    """Locates every seed via watershed segmentation; classifies each by
+    ellipse axis ratio + circularity. Returns 'pepper', 'adulterant', or
+    'ambiguous' for crops the hybrid layer should defer to YOLO."""
+
+    def detect(self, frame_bgr, **_kwargs):
+        gray    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        sure_bg = cv2.dilate(opening, kernel, iterations=2)
+
+        dist = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+        if dist.max() == 0:
+            return []
+        _, sure_fg = cv2.threshold(dist, WATERSHED_DIST_THRESH, 255, 0)
+        sure_fg = np.uint8(sure_fg)
+
+        unknown = cv2.subtract(sure_bg, sure_fg)
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers += 1
+        markers[unknown == 255] = 0
+        markers = cv2.watershed(frame_bgr.copy(), markers)
+
+        detections = []
+        for label in range(2, int(markers.max()) + 1):
+            mask = np.uint8(markers == label) * 255
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+            area = cv2.contourArea(cnt)
+            if area < MIN_CONTOUR_AREA or area > MAX_CONTOUR_AREA:
+                continue
+            if len(cnt) < 5:
+                continue  # fitEllipse needs ≥5 points
+            peri = cv2.arcLength(cnt, True)
+            if peri == 0:
+                continue
+            circularity = 4.0 * np.pi * area / (peri * peri)
+            (_, _), (d1, d2), _ = cv2.fitEllipse(cnt)
+            if max(d1, d2) == 0:
+                continue
+            axis_ratio = min(d1, d2) / max(d1, d2)
+            x, y, w, h = cv2.boundingRect(cnt)
+
+            if axis_ratio >= AXIS_RATIO_PEPPER and circularity >= CIRCULARITY_PEPPER:
+                cls_name = "pepper"
+            elif axis_ratio <= AXIS_RATIO_ADULTERANT or circularity <= CIRCULARITY_ADULTERANT:
+                cls_name = "adulterant"
+            else:
+                cls_name = "ambiguous"
+
+            detections.append({
+                "x1": x, "y1": y,
+                "x2": x + w, "y2": y + h,
+                "confidence": round(axis_ratio, 3),
+                "class_id": CLASS_IDS.get(cls_name, 0),
+                "class_name": cls_name,
+                "circularity": round(circularity, 3),
+            })
+        return detections
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# YOLO Detection Engine  (tiled detector — YOLO localizes seeds across the frame)
+# ═══════════════════════════════════════════════════════════════════════════
+class YOLODetectionEngine:
+    """Loads best.pt and runs tiled YOLO inference for seed localization."""
+
+    def __init__(self):
+        from ultralytics import YOLO
+        if not PT_MODEL_PATH.exists():
+            raise FileNotFoundError(f"No model at {PT_MODEL_PATH}")
+        self.model = YOLO(str(PT_MODEL_PATH))
+        print(f"[YOLO] Loaded {PT_MODEL_PATH}")
+        dummy = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.uint8)
+        self.model.predict(source=dummy, conf=YOLO_CONF, iou=YOLO_IOU,
+                           imgsz=TILE_SIZE, verbose=False)
+        print("[YOLO] Warmup complete")
+
+    def detect(self, frame_bgr):
+        return _tile_and_detect_yolo(self.model, frame_bgr, YOLO_CONF, YOLO_IOU)
+
+
+def _tile_and_detect_yolo(model, frame_bgr, conf, iou):
+    """Run YOLO on overlapping tiles, merge with cross-tile NMS + soft
+    containment dedup. No edge-margin or aspect-ratio filtering — those were
+    eating real detections."""
+    fh, fw = frame_bgr.shape[:2]
+    step = TILE_SIZE - TILE_OVERLAP
+
+    def _corners(total, size, s):
+        pts = list(range(0, total - size + 1, s))
+        if not pts or pts[-1] + size < total:
+            pts.append(max(0, total - size))
+        return pts
+
+    all_dets = []
+    for ty in _corners(fh, TILE_SIZE, step):
+        for tx in _corners(fw, TILE_SIZE, step):
+            tile = frame_bgr[ty:ty + TILE_SIZE, tx:tx + TILE_SIZE]
+            results = model.predict(source=tile, conf=conf, iou=iou,
+                                    imgsz=TILE_SIZE, verbose=False)
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                    cls_id = int(box.cls[0])
+                    all_dets.append({
+                        "x1": x1 + tx, "y1": y1 + ty,
+                        "x2": x2 + tx, "y2": y2 + ty,
+                        "confidence": float(box.conf[0]),
+                        "class_id": cls_id,
+                        "class_name": model.names.get(cls_id, f"class_{cls_id}"),
+                    })
+
+    if not all_dets:
+        return []
+
+    boxes  = [[d["x1"], d["y1"], d["x2"] - d["x1"], d["y2"] - d["y1"]] for d in all_dets]
+    scores = [d["confidence"] for d in all_dets]
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf, YOLO_NMS_IOU)
+    if len(indices) == 0:
+        return []
+    survivors = [all_dets[i] for i in indices.flatten()]
+
+    # Soft containment dedup: only suppress when smaller box is mostly inside
+    # the larger (genuine subset), not just adjacent.
+    survivors.sort(key=lambda d: -((d["x2"] - d["x1"]) * (d["y2"] - d["y1"])))
+    final = []
+    for d in survivors:
+        d_area = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
+        d_cx = (d["x1"] + d["x2"]) // 2
+        d_cy = (d["y1"] + d["y2"]) // 2
+        suppressed = False
+        for f in final:
+            if f["x1"] <= d_cx <= f["x2"] and f["y1"] <= d_cy <= f["y2"]:
+                f_area = (f["x2"] - f["x1"]) * (f["y2"] - f["y1"])
+                if f_area > 0 and d_area < CONTAINMENT_RATIO * f_area:
+                    suppressed = True
+                    break
+        if not suppressed:
+            final.append(d)
+    return final
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Hybrid Detection Engine  (YOLO locates → shape confirms class + fills gaps)
+# ═══════════════════════════════════════════════════════════════════════════
+class HybridDetectionEngine:
+    """YOLO localizes seeds across the frame; shape classifier overrides
+    YOLO's class only when shape is confidently pepper or adulterant. Shape
+    gap-fill runs on the whole frame to recover seeds YOLO missed."""
+
+    def __init__(self):
+        self.shape = ShapeDetectionEngine()
+        try:
+            self.yolo = YOLODetectionEngine()
+            self._has_yolo = True
+        except FileNotFoundError:
+            self.yolo = None
+            self._has_yolo = False
+
+    @property
+    def engine_label(self):
+        return "YOLO + Shape" if self._has_yolo else "Shape only"
+
+    def detect(self, frame_bgr, **_kwargs):
+        if not self._has_yolo:
+            dets = self.shape.detect(frame_bgr)
+            for d in dets:
+                if d["class_name"] == "ambiguous":
+                    d["class_name"] = "adulterant"
+                    d["class_id"] = CLASS_IDS["adulterant"]
+            return dets
+
+        # 1. YOLO finds seeds across the whole frame
+        yolo_dets = self.yolo.detect(frame_bgr)
+
+        # 2. Shape-classify each YOLO crop; respect shape only when confident
+        for det in yolo_dets:
+            crop = frame_bgr[det["y1"]:det["y2"], det["x1"]:det["x2"]]
+            shape_cls, tight = self._classify_crop_tight(crop)
+            if shape_cls in ("pepper", "adulterant"):
+                det["class_name"] = shape_cls
+                det["class_id"] = CLASS_IDS[shape_cls]
+                if tight is not None:
+                    ox, oy = det["x1"], det["y1"]
+                    det["x1"], det["y1"] = ox + tight[0], oy + tight[1]
+                    det["x2"], det["y2"] = ox + tight[2], oy + tight[3]
+            # else: ambiguous → keep YOLO's class
+
+        # 3. Shape gap-fill on whole frame — add anything YOLO missed
+        for sd in self.shape.detect(frame_bgr):
+            cx = (sd["x1"] + sd["x2"]) // 2
+            cy = (sd["y1"] + sd["y2"]) // 2
+            if any(yd["x1"] <= cx <= yd["x2"] and yd["y1"] <= cy <= yd["y2"]
+                   for yd in yolo_dets):
+                continue
+            if sd["class_name"] == "ambiguous":
+                sd["class_name"] = "adulterant"
+                sd["class_id"] = CLASS_IDS["adulterant"]
+            yolo_dets.append(sd)
+        return yolo_dets
+
+    @staticmethod
+    def _classify_crop_tight(crop_bgr):
+        """Classify a YOLO crop and return the tight bounding rect of the seed.
+        Returns (class_name|None, (x1,y1,x2,y2)|None) in crop-local coords."""
+        if crop_bgr.size == 0:
+            return None, None
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None, None
+        cnt = max(cnts, key=cv2.contourArea)
+        if len(cnt) < 5:
+            return None, None
+        area = cv2.contourArea(cnt)
+        peri = cv2.arcLength(cnt, True)
+        if area == 0 or peri == 0:
+            return None, None
+        circularity = 4.0 * np.pi * area / (peri * peri)
+        (_, _), (d1, d2), _ = cv2.fitEllipse(cnt)
+        if max(d1, d2) == 0:
+            return None, None
+        axis_ratio = min(d1, d2) / max(d1, d2)
+        x, y, w, h = cv2.boundingRect(cnt)
+        tight = (x, y, x + w, y + h)
+        if axis_ratio >= AXIS_RATIO_PEPPER and circularity >= CIRCULARITY_PEPPER:
+            return "pepper", tight
+        if axis_ratio <= AXIS_RATIO_ADULTERANT or circularity <= CIRCULARITY_ADULTERANT:
+            return "adulterant", tight
+        return None, None  # ambiguous → caller keeps YOLO's class
+
+    def reload(self):
+        """Reload YOLO weights after fine-tuning."""
+        if self._has_yolo:
+            self.yolo = YOLODetectionEngine()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Camera Manager
+# ═══════════════════════════════════════════════════════════════════════════
+class CameraManager:
+    """Wraps picamera2 with dual-stream macro configuration."""
+
+    def __init__(self):
+        self.picam2 = None
+        self.running = False
+
+    def start(self):
+        self.picam2 = Picamera2()
+        config = self.picam2.create_video_configuration(
+            main={"format": "RGB888", "size": CAPTURE_RESOLUTION},
+            lores={"format": "YUV420", "size": PREVIEW_RESOLUTION},
+            controls=MACRO_CONTROLS,
+        )
+        self.picam2.configure(config)
+        self.picam2.start()
+        time.sleep(2)  # let AF and exposure settle
+        self.running = True
+
+    def get_frame(self):
+        """Capture lores frame for detection. Returns BGR numpy array."""
+        if not self.running:
+            return None
+        rgb = self.picam2.capture_array("main")
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return cv2.resize(bgr, DETECTION_RESOLUTION, interpolation=cv2.INTER_AREA)
+
+    def stop(self):
+        self.running = False
+        if self.picam2:
+            try:
+                self.picam2.stop()
+                self.picam2.close()
+            except Exception:
+                pass
+            self.picam2 = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Drawing & Stats utilities
+# ═══════════════════════════════════════════════════════════════════════════
+def draw_detections(frame_bgr, detections):
+    """Draw colored bounding boxes on the frame (no labels). Returns frame."""
+    for det in detections:
+        color = CLASS_COLORS.get(det["class_name"], (255, 255, 255))
+        cv2.rectangle(frame_bgr,
+                      (det["x1"], det["y1"]),
+                      (det["x2"], det["y2"]),
+                      color, 2)
+    return frame_bgr
+
+
+def compute_stats(detections):
+    """Compute seed counts and adulterant percentage."""
+    adulterant = sum(1 for d in detections if d["class_name"] == "adulterant")
+    pepper = sum(1 for d in detections if d["class_name"] == "pepper")
+    total = adulterant + pepper
+    pct = (adulterant / total * 100) if total > 0 else 0.0
+    return {
+        "adulterant_count": adulterant,
+        "pepper_count": pepper,
+        "total_count": total,
+        "adulterant_pct": pct,
+    }
+
+
+def frame_to_photoimage(frame_bgr):
+    """Convert BGR numpy array to Tkinter PhotoImage, letterboxed to CANVAS_W x CANVAS_H."""
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w = frame_rgb.shape[:2]
+    scale = min(CANVAS_W / w, CANVAS_H / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    pil_img = Image.fromarray(frame_rgb).resize((new_w, new_h), Image.BILINEAR)
+    return ImageTk.PhotoImage(image=pil_img), new_w, new_h
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Application
+# ═══════════════════════════════════════════════════════════════════════════
+class DetectorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PEPPAH - Adulterant Detector")
+        self.root.configure(bg=BG_DARK)
+
+        # Detection state
+        self.running = False
+        self.detection_thread = None
+        self.camera = None
+        self.engine = None
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.stop_event = threading.Event()
+        self._photo = None
+        self._last_annotated = None
+        self._last_raw_frame = None
+        self._last_detections = None
+
+        # Correction mode state
+        self._correction_mode = False
+        self._correction_frame = None
+        self._correction_boxes = []
+        self._selected_idx = None
+        self._draw_start = None
+        self._current_class = "adulterant"
+        self._correction_count = self._count_saved_corrections()
+
+        # Fine-tuning state
+        self._finetuning = False
+        self._ft_cancel_event = threading.Event()
+
+        self.engine = HybridDetectionEngine()
+        self._engine_label = self.engine.engine_label
+
+        # Build UI
+        self._build_status_bar()
+        self._build_controls_bar()
+        self._build_content()
+
+        # Show which engine is active
+        self.status_var.set(f"Ready [{self._engine_label}] — Click Start to begin")
+
+        # Start UI polling loop
+        self._schedule_ui_update()
+
+    # -------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------
+    def _count_saved_corrections(self):
+        d = TRAINING_DIR / "images" / "train"
+        return len(list(d.glob("correction_*.jpg"))) if d.exists() else 0
+
+    # -------------------------------------------------------------------
+    # UI Construction
+    # -------------------------------------------------------------------
+    def _build_status_bar(self):
+        self.status_var = tk.StringVar(value="Ready - Click Start to begin live detection")
+        bar = tk.Label(
+            self.root, textvariable=self.status_var,
+            bg="#1a1a1a", fg=FG_DIM, font=("Helvetica", 10),
+            anchor=tk.W, padx=10,
+        )
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _build_controls_bar(self):
+        bar = tk.Frame(self.root, bg=BG_BAR, height=50)
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        bar.pack_propagate(False)
+
+        # --- Normal controls (shown by default) ---
+        self._normal_controls = tk.Frame(bar, bg=BG_BAR)
+        self._normal_controls.pack(fill=tk.X)
+
+        self.btn_start = tk.Button(
+            self._normal_controls, text="Start", command=self._toggle_live,
+            bg=GREEN, fg=FG_WHITE, activebackground=GREEN,
+            font=("Helvetica", 11, "bold"), width=12,
+        )
+        self.btn_start.pack(side=tk.LEFT, padx=15, pady=8)
+
+        self.btn_browse = tk.Button(
+            self._normal_controls, text="Browse Image", command=self._browse_image,
+            bg=BLUE, fg=FG_WHITE, activebackground=BLUE,
+            font=("Helvetica", 11), width=14,
+        )
+        self.btn_browse.pack(side=tk.LEFT, padx=5, pady=8)
+
+        self.btn_save = tk.Button(
+            self._normal_controls, text="Save Result", command=self._save_result,
+            bg=ORANGE, fg=FG_WHITE, activebackground=ORANGE,
+            font=("Helvetica", 11), width=12, state=tk.DISABLED,
+        )
+        self.btn_save.pack(side=tk.LEFT, padx=5, pady=8)
+
+        self.btn_correct = tk.Button(
+            self._normal_controls, text="Correct", command=self._enter_correction_mode,
+            bg=PURPLE, fg=FG_WHITE, activebackground=PURPLE,
+            font=("Helvetica", 11), width=10, state=tk.DISABLED,
+        )
+        self.btn_correct.pack(side=tk.LEFT, padx=5, pady=8)
+
+        self.btn_refresh = tk.Button(
+            self._normal_controls, text="Refresh", command=self._refresh,
+            bg=BLUE, fg=FG_WHITE, activebackground=BLUE,
+            font=("Helvetica", 11), width=10, state=tk.DISABLED,
+        )
+        self.btn_refresh.pack(side=tk.LEFT, padx=5, pady=8)
+
+        self.btn_shutdown = tk.Button(
+            self._normal_controls, text="Shutdown", command=self._shutdown,
+            bg="#660000", fg=FG_WHITE, activebackground="#660000",
+            font=("Helvetica", 11, "bold"), width=10,
+        )
+        self.btn_shutdown.pack(side=tk.RIGHT, padx=(5, 15), pady=8)
+
+        self.btn_exit = tk.Button(
+            self._normal_controls, text="Exit", command=self.on_close,
+            bg=INACTIVE, fg=FG_WHITE, activebackground=INACTIVE,
+            font=("Helvetica", 11, "bold"), width=8,
+        )
+        self.btn_exit.pack(side=tk.RIGHT, padx=5, pady=8)
+
+        # --- Correction controls (hidden initially) ---
+        self._correction_controls = tk.Frame(bar, bg=BG_BAR)
+
+        tk.Button(
+            self._correction_controls, text="Exit", command=self._exit_correction_mode,
+            bg=INACTIVE, fg=FG_WHITE, font=("Helvetica", 11), width=8,
+        ).pack(side=tk.LEFT, padx=(15, 5), pady=8)
+
+        self.btn_set_adulterant = tk.Button(
+            self._correction_controls, text="→ Adulterant",
+            command=lambda: self._set_correction_class("adulterant"),
+            bg="#CC2222", fg=FG_WHITE, font=("Helvetica", 11), width=12,
+        )
+        self.btn_set_adulterant.pack(side=tk.LEFT, padx=5, pady=8)
+
+        self.btn_set_pepper = tk.Button(
+            self._correction_controls, text="→ Pepper",
+            command=lambda: self._set_correction_class("pepper"),
+            bg="#007700", fg=FG_WHITE, font=("Helvetica", 11), width=10,
+        )
+        self.btn_set_pepper.pack(side=tk.LEFT, padx=5, pady=8)
+
+        tk.Button(
+            self._correction_controls, text="Save Correction",
+            command=self._save_correction,
+            bg=ORANGE, fg=FG_WHITE, font=("Helvetica", 11, "bold"), width=14,
+        ).pack(side=tk.LEFT, padx=5, pady=8)
+
+        tk.Label(
+            self._correction_controls,
+            text="Del = remove box | Drag = new box",
+            bg=BG_BAR, fg=FG_DIM, font=("Helvetica", 9),
+        ).pack(side=tk.LEFT, padx=10)
+
+    def _build_content(self):
+        content = tk.Frame(self.root, bg=BG_DARK)
+        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Left: video / image canvas
+        self.canvas = tk.Canvas(
+            content, width=CANVAS_W, height=CANVAS_H,
+            bg="black", highlightthickness=0,
+        )
+        self.canvas.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Right: stats panel
+        stats = tk.Frame(content, bg=BG_DARK, width=340)
+        stats.pack(side=tk.RIGHT, fill=tk.Y)
+        stats.pack_propagate(False)
+
+        tk.Label(
+            stats, text="DETECTION RESULTS",
+            font=("Helvetica", 14, "bold"), bg=BG_DARK, fg=FG_WHITE,
+        ).pack(pady=(20, 10))
+
+        # Color legend
+        legend = tk.Frame(stats, bg=BG_DARK)
+        legend.pack(fill=tk.X, padx=20, pady=(0, 8))
+        for color_hex, label_text in [("#00C800", "Black Pepper"), ("#FF4444", "Papaya Seed (Adulterant)")]:
+            entry = tk.Frame(legend, bg=BG_DARK)
+            entry.pack(fill=tk.X, pady=2)
+            tk.Canvas(entry, width=16, height=16, bg=color_hex,
+                      highlightthickness=1, highlightbackground="#555").pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(entry, text=label_text, font=("Helvetica", 11),
+                     bg=BG_DARK, fg="#cccccc").pack(side=tk.LEFT)
+
+        ttk.Separator(stats).pack(fill=tk.X, padx=20)
+
+        self.lbl_pepper = self._stat_row(stats, "Black Pepper:", "0", "#00C800")
+        self.lbl_adulterant = self._stat_row(stats, "Papaya Seeds:", "0", "#FF4444")
+
+        ttk.Separator(stats).pack(fill=tk.X, padx=20, pady=5)
+
+        self.lbl_total = self._stat_row(stats, "Total Seeds:", "0")
+        self.lbl_pct = self._stat_row(stats, "Adulterant %:", "0.0%", "#FF4444")
+
+        # --- Active learning section ---
+        ttk.Separator(stats).pack(fill=tk.X, padx=20, pady=5)
+
+        self.lbl_corrections = self._stat_row(
+            stats, "Corrections:", str(self._correction_count), "#BB86FC"
+        )
+
+        btn_row = tk.Frame(stats, bg=BG_DARK)
+        btn_row.pack(fill=tk.X, padx=20, pady=(6, 2))
+        self.btn_finetune = tk.Button(
+            btn_row, text=FINETUNE_BTN_LABEL,
+            command=self._start_finetune,
+            bg=PURPLE, fg=FG_WHITE, activebackground=PURPLE,
+            font=("Helvetica", 11, "bold"),
+            state=tk.NORMAL if self._correction_count >= FINETUNE_MIN_SAMPLES else tk.DISABLED,
+        )
+        self.btn_finetune.pack(fill=tk.X)
+
+        self.ft_progress = ttk.Progressbar(
+            stats, orient="horizontal", mode="determinate",
+            maximum=FINETUNE_EPOCHS, value=0,
+        )
+        self.lbl_ft_epoch = tk.Label(
+            stats, text="", bg=BG_DARK, fg=FG_DIM, font=("Helvetica", 9),
+        )
+        self.btn_cancel_ft = tk.Button(
+            stats, text="Cancel Fine-tune",
+            command=self._cancel_finetune,
+            bg=RED, fg=FG_WHITE, activebackground=RED,
+            font=("Helvetica", 10),
+        )
+        # ft_progress, lbl_ft_epoch, btn_cancel_ft are hidden until training starts
+
+        tk.Label(
+            stats, text=f"(need ≥{FINETUNE_MIN_SAMPLES} corrections to enable)",
+            bg=BG_DARK, fg=FG_DIM, font=("Helvetica", 9),
+        ).pack()
+
+    def _stat_row(self, parent, label, value, fg="#FFFFFF"):
+        row = tk.Frame(parent, bg=BG_DARK)
+        row.pack(fill=tk.X, padx=20, pady=4)
+        tk.Label(row, text=label, font=("Helvetica", 13),
+                 bg=BG_DARK, fg="#cccccc").pack(side=tk.LEFT)
+        val = tk.Label(row, text=value, font=("Helvetica", 16, "bold"),
+                       bg=BG_DARK, fg=fg)
+        val.pack(side=tk.RIGHT)
+        return val
+
+    # -------------------------------------------------------------------
+    # Live detection
+    # -------------------------------------------------------------------
+    def _toggle_live(self):
+        if self.running:
+            self._stop_live()
+        else:
+            self._start_live()
+
+    def _start_live(self):
+        self.status_var.set("Starting camera...")
+        self.root.update()
+
+        try:
+            self.camera = CameraManager()
+            self.camera.start()
+        except Exception as e:
+            self.status_var.set(f"Camera error: {e}")
+            return
+
+        self.stop_event.clear()
+        self.running = True
+        self.detection_thread = threading.Thread(
+            target=self._detection_loop, daemon=True
+        )
+        self.detection_thread.start()
+
+        self.btn_start.configure(text="Stop", bg=RED, activebackground=RED)
+        self.btn_save.configure(state=tk.NORMAL)
+        self.btn_correct.configure(state=tk.NORMAL)
+        self.btn_refresh.configure(state=tk.NORMAL)
+        self.status_var.set("Live Detection - Running")
+
+    def _stop_live(self):
+        self.stop_event.set()
+        self.running = False
+        if self.detection_thread:
+            self.detection_thread.join(timeout=10)
+            self.detection_thread = None
+        if self.camera:
+            self.camera.stop()
+            self.camera = None
+
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.btn_start.configure(text="Start", bg=GREEN, activebackground=GREEN)
+        self.btn_refresh.configure(state=tk.DISABLED)
+        self.status_var.set("Live Detection - Stopped")
+
+    def _detection_loop(self):
+        """Background thread: capture -> detect -> draw -> enqueue."""
+        while not self.stop_event.is_set():
+            frame = self.camera.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            detections = self.engine.detect(frame)
+            annotated = draw_detections(frame.copy(), detections)
+
+            stats = compute_stats(detections)
+            self._last_raw_frame = frame.copy()
+            self._last_annotated = annotated
+            self._last_detections = detections
+
+            try:
+                self.frame_queue.put_nowait((annotated, stats))
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self.frame_queue.put_nowait((annotated, stats))
+
+    # -------------------------------------------------------------------
+    # Image detection
+    # -------------------------------------------------------------------
+    def _browse_image(self):
+        filepath = filedialog.askopenfilename(
+            initialdir=str(MODEL_DIR / "captures"),
+            title="Select Image",
+            filetypes=[
+                ("Image files", "*.jpg *.jpeg *.png *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not filepath:
+            return
+        if self.running:
+            self._stop_live()
+        frame_bgr = cv2.imread(filepath)
+        if frame_bgr is None:
+            self.status_var.set(f"Error: Could not load {Path(filepath).name}")
+            return
+        self._update_canvas(frame_bgr)
+        self.status_var.set(f"Viewing: {Path(filepath).name}")
+
+    # -------------------------------------------------------------------
+    # UI update loop (main thread)
+    # -------------------------------------------------------------------
+    def _schedule_ui_update(self):
+        if not self._correction_mode:
+            try:
+                while not self.frame_queue.empty():
+                    frame_bgr, stats = self.frame_queue.get_nowait()
+                    self._update_canvas(frame_bgr)
+                    self._update_stats(stats)
+            except queue.Empty:
+                pass
+        self.root.after(50, self._schedule_ui_update)
+
+    def _update_canvas(self, frame_bgr):
+        photo, new_w, new_h = frame_to_photoimage(frame_bgr)
+        self._photo = photo
+        x_off = (CANVAS_W - new_w) // 2
+        y_off = (CANVAS_H - new_h) // 2
+        self.canvas.delete("all")
+        self.canvas.create_image(x_off, y_off, anchor=tk.NW, image=self._photo)
+
+    def _update_stats(self, stats):
+        self.lbl_pepper.configure(text=str(stats["pepper_count"]))
+        self.lbl_adulterant.configure(text=str(stats["adulterant_count"]))
+        self.lbl_total.configure(text=str(stats["total_count"]))
+        self.lbl_pct.configure(text=f"{stats['adulterant_pct']:.1f}%")
+
+        pct = stats["adulterant_pct"]
+        color = "#00C800" if pct == 0 else ("#FFD700" if pct < 10 else "#FF4444")
+        self.lbl_pct.configure(fg=color)
+
+    # -------------------------------------------------------------------
+    # Correction Mode
+    # -------------------------------------------------------------------
+    def _enter_correction_mode(self):
+        if self._last_raw_frame is None:
+            self.status_var.set("No frame to correct — start live detection first")
+            return
+
+        if self.running:
+            self._stop_live()
+
+        self._correction_mode = True
+        self._correction_frame = self._last_raw_frame.copy()
+        self._correction_boxes = [dict(d) for d in (self._last_detections or [])]
+        self._selected_idx = None
+        self._draw_start = None
+
+        # Bind canvas events
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.canvas.bind("<Delete>", self._on_canvas_delete)
+        self.canvas.bind("<BackSpace>", self._on_canvas_delete)
+        self.canvas.focus_set()
+
+        # Swap controls bar
+        self._normal_controls.pack_forget()
+        self._correction_controls.pack(fill=tk.X)
+
+        self._redraw_correction_canvas()
+        self.status_var.set(
+            "Correction Mode — click box to select | drag empty area to add | Del to remove"
+        )
+
+    def _exit_correction_mode(self):
+        self._correction_mode = False
+        self._correction_frame = None
+        self._correction_boxes = []
+        self._selected_idx = None
+        self._draw_start = None
+
+        self.canvas.unbind("<Button-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.canvas.unbind("<Delete>")
+        self.canvas.unbind("<BackSpace>")
+
+        self._correction_controls.pack_forget()
+        self._normal_controls.pack(fill=tk.X)
+        self.status_var.set("Ready")
+
+    def _canvas_to_frame(self, cx, cy):
+        """Convert canvas pixel coords to detection frame pixel coords."""
+        fw, fh = DETECTION_RESOLUTION
+        fx = max(0, min(fw - 1, int((cx - CANVAS_X_OFFSET) / CANVAS_SCALE)))
+        fy = max(0, min(fh - 1, int((cy - CANVAS_Y_OFFSET) / CANVAS_SCALE)))
+        return fx, fy
+
+
+    def _hit_test(self, cx, cy):
+        """Return index of correction box that contains canvas point (cx, cy), or None."""
+        for i, b in enumerate(self._correction_boxes):
+            bx1 = int(b["x1"] * CANVAS_SCALE) + CANVAS_X_OFFSET - 4
+            by1 = int(b["y1"] * CANVAS_SCALE) + CANVAS_Y_OFFSET - 4
+            bx2 = int(b["x2"] * CANVAS_SCALE) + CANVAS_X_OFFSET + 4
+            by2 = int(b["y2"] * CANVAS_SCALE) + CANVAS_Y_OFFSET + 4
+            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                return i
+        return None
+
+    def _on_canvas_click(self, event):
+        idx = self._hit_test(event.x, event.y)
+        if idx is not None:
+            self._selected_idx = idx
+            self._draw_start = None
+        else:
+            self._selected_idx = None
+            self._draw_start = (event.x, event.y)
+        self._redraw_correction_canvas()
+
+    def _on_canvas_drag(self, event):
+        if self._draw_start is not None:
+            self._redraw_correction_canvas(drag_end=(event.x, event.y))
+
+    def _on_canvas_release(self, event):
+        if self._draw_start is not None:
+            sx, sy = self._draw_start
+            ex, ey = event.x, event.y
+            if abs(ex - sx) > 8 and abs(ey - sy) > 8:
+                fx1, fy1 = self._canvas_to_frame(min(sx, ex), min(sy, ey))
+                fx2, fy2 = self._canvas_to_frame(max(sx, ex), max(sy, ey))
+                cls_id = CLASS_IDS.get(self._current_class, 0)
+                self._correction_boxes.append({
+                    "x1": fx1, "y1": fy1, "x2": fx2, "y2": fy2,
+                    "class_id": cls_id, "class_name": self._current_class,
+                })
+                self._selected_idx = len(self._correction_boxes) - 1
+            self._draw_start = None
+            self._redraw_correction_canvas()
+
+    def _on_canvas_delete(self, event):
+        if self._selected_idx is not None:
+            del self._correction_boxes[self._selected_idx]
+            self._selected_idx = None
+            self._redraw_correction_canvas()
+
+    def _set_correction_class(self, cls_name):
+        self._current_class = cls_name
+        if self._selected_idx is not None:
+            b = self._correction_boxes[self._selected_idx]
+            b["class_name"] = cls_name
+            b["class_id"] = CLASS_IDS.get(cls_name, 0)
+            self._redraw_correction_canvas()
+
+    def _redraw_correction_canvas(self, drag_end=None):
+        frame = self._correction_frame
+        if frame is None:
+            return
+
+        display = frame.copy()
+        for i, b in enumerate(self._correction_boxes):
+            color = CLASS_COLORS.get(b["class_name"], (255, 255, 255))
+            cv2.rectangle(display, (b["x1"], b["y1"]), (b["x2"], b["y2"]), color, 2)
+            if i == self._selected_idx:
+                # White selection outline
+                cv2.rectangle(display,
+                              (b["x1"] - 2, b["y1"] - 2),
+                              (b["x2"] + 2, b["y2"] + 2),
+                              (255, 255, 255), 1)
+
+        photo, new_w, new_h = frame_to_photoimage(display)
+        self._photo = photo
+        x_off = (CANVAS_W - new_w) // 2
+        y_off = (CANVAS_H - new_h) // 2
+        self.canvas.delete("all")
+        self.canvas.create_image(x_off, y_off, anchor=tk.NW, image=self._photo)
+
+        # Rubber-band rect while dragging
+        if drag_end is not None and self._draw_start is not None:
+            outline = "#FF4444" if self._current_class == "adulterant" else "#00C800"
+            self.canvas.create_rectangle(
+                self._draw_start[0], self._draw_start[1],
+                drag_end[0], drag_end[1],
+                outline=outline, width=2, dash=(4, 4),
+            )
+
+    # -------------------------------------------------------------------
+    # Save correction
+    # -------------------------------------------------------------------
+    def _save_correction(self):
+        if self._correction_frame is None:
+            return
+
+        self._ensure_training_structure()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
+        img_path = TRAINING_DIR / "images" / "train" / f"correction_{ts}.jpg"
+        lbl_path = TRAINING_DIR / "labels" / "train" / f"correction_{ts}.txt"
+
+        cv2.imwrite(str(img_path), self._correction_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        fw, fh = DETECTION_RESOLUTION
+        lines = []
+        for b in self._correction_boxes:
+            xc = ((b["x1"] + b["x2"]) / 2) / fw
+            yc = ((b["y1"] + b["y2"]) / 2) / fh
+            bw = (b["x2"] - b["x1"]) / fw
+            bh = (b["y2"] - b["y1"]) / fh
+            lines.append(f"{b['class_id']} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+        lbl_path.write_text("\n".join(lines))
+
+        self._correction_count += 1
+        self._split_correction_to_val(img_path, lbl_path)
+        self.lbl_corrections.configure(text=str(self._correction_count))
+        self._update_finetune_button()
+        self.status_var.set(
+            f"Saved correction #{self._correction_count} ({img_path.name}) — "
+            f"{len(self._correction_boxes)} boxes"
+        )
+        self._exit_correction_mode()
+
+    def _ensure_training_structure(self):
+        for subdir in ["images/train", "labels/train", "images/val", "labels/val"]:
+            (TRAINING_DIR / subdir).mkdir(parents=True, exist_ok=True)
+        data_yaml = TRAINING_DIR / "data.yaml"
+        if not data_yaml.exists():
+            data_yaml.write_text(
+                f"path: {TRAINING_DIR}\n"
+                "train: images/train\n"
+                "val: images/val\n"
+                "nc: 2\n"
+                "names:\n"
+                "  0: adulterant\n"
+                "  1: pepper\n"
+            )
+
+    def _split_correction_to_val(self, img_path: Path, lbl_path: Path):
+        """Move ~20% of corrections to val set (every 5th by count)."""
+        if self._correction_count % 5 == 0:
+            val_img = TRAINING_DIR / "images" / "val" / img_path.name
+            val_lbl = TRAINING_DIR / "labels" / "val" / lbl_path.name
+            shutil.move(str(img_path), val_img)
+            shutil.move(str(lbl_path), val_lbl)
+
+    def _update_finetune_button(self):
+        enabled = self._correction_count >= FINETUNE_MIN_SAMPLES and not self._finetuning
+        self.btn_finetune.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    # -------------------------------------------------------------------
+    # Fine-tuning
+    # -------------------------------------------------------------------
+    def _start_finetune(self):
+        if self._finetuning:
+            return
+        if not messagebox.askyesno(
+            "Fine-tune Model",
+            f"Train on {self._correction_count} corrections for {FINETUNE_EPOCHS} epochs?\n\n"
+            "This may take 30–60+ minutes on CPU and will replace the current model.\n"
+            "A backup of the current model will be saved automatically.",
+        ):
+            return
+        if self.running:
+            self._stop_live()
+        self._finetuning = True
+        self._ft_cancel_event.clear()
+        self.btn_finetune.configure(state=tk.DISABLED, text="Fine-tuning...")
+        self.ft_progress.configure(value=0)
+        self.ft_progress.pack(fill=tk.X, padx=20, pady=(2, 0))
+        self.lbl_ft_epoch.configure(text=f"Epoch 0 / {FINETUNE_EPOCHS}")
+        self.lbl_ft_epoch.pack()
+        self.btn_cancel_ft.configure(state=tk.NORMAL)
+        self.btn_cancel_ft.pack(fill=tk.X, padx=20, pady=(4, 4))
+        self.status_var.set(
+            f"Fine-tuning started ({self._correction_count} corrections) — may take 30–60+ min on CPU..."
+        )
+        threading.Thread(target=self._run_finetune_thread, daemon=True).start()
+
+    def _cancel_finetune(self):
+        self._ft_cancel_event.set()
+        self.btn_cancel_ft.configure(state=tk.DISABLED)
+        self.status_var.set("Cancelling fine-tune — waiting for current epoch to finish...")
+
+    def _run_finetune_thread(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"run_{ts}"
+        error_log = MODEL_DIR / "finetune_run" / "error.log"
+        try:
+            # Back up current model before overwriting
+            backup = PT_MODEL_PATH.with_suffix(f".pre-finetune-{ts}.pt")
+            if PT_MODEL_PATH.exists():
+                shutil.copy(PT_MODEL_PATH, backup)
+
+            from ultralytics import YOLO
+            model = YOLO(str(PT_MODEL_PATH))
+
+            def _on_epoch_end(trainer):
+                epoch = trainer.epoch + 1
+                self.root.after(0, lambda e=epoch: self.ft_progress.configure(value=e))
+                self.root.after(0, lambda e=epoch: self.lbl_ft_epoch.configure(
+                    text=f"Epoch {e} / {FINETUNE_EPOCHS}"
+                ))
+                if self._ft_cancel_event.is_set():
+                    raise KeyboardInterrupt("Fine-tune cancelled by user")
+
+            model.add_callback("on_train_epoch_end", _on_epoch_end)
+            model.train(
+                data=str(TRAINING_DIR / "data.yaml"),
+                epochs=FINETUNE_EPOCHS,
+                imgsz=640,
+                freeze=10,
+                batch=4,
+                device="cpu",
+                project=str(MODEL_DIR / "finetune_run"),
+                name=run_name,
+                exist_ok=False,
+                verbose=False,
+            )
+            best = MODEL_DIR / "finetune_run" / run_name / "weights" / "best.pt"
+            if best.exists():
+                self.root.after(0, lambda: self.lbl_ft_epoch.configure(
+                    text="Evaluating fine-tuned model…"
+                ))
+                ft_map = model.val(
+                    data=str(TRAINING_DIR / "data.yaml"), verbose=False
+                ).box.map50
+
+                if backup.exists():
+                    self.root.after(0, lambda: self.lbl_ft_epoch.configure(
+                        text="Evaluating original model…"
+                    ))
+                    orig_map = YOLO(str(backup)).val(
+                        data=str(TRAINING_DIR / "data.yaml"), verbose=False
+                    ).box.map50
+                else:
+                    orig_map = 0.0
+
+                if ft_map > orig_map:
+                    shutil.copy(best, PT_MODEL_PATH)
+                    def _on_done(fm=ft_map, om=orig_map):
+                        self.status_var.set(
+                            f"Fine-tuning complete — model updated! "
+                            f"mAP50: {fm:.1%} vs original {om:.1%}. "
+                            "Restart detection to apply."
+                        )
+                        if hasattr(self.engine, "reload"):
+                            self.engine.reload()
+                    self.root.after(0, _on_done)
+                else:
+                    def _on_reject(fm=ft_map, om=orig_map):
+                        self.status_var.set(
+                            f"Fine-tuned model rejected — original is better "
+                            f"(mAP50 {om:.1%} vs {fm:.1%}). Original model kept."
+                        )
+                    self.root.after(0, _on_reject)
+            else:
+                self.root.after(0, lambda: self.status_var.set(
+                    f"Fine-tuning done but best.pt not found — check finetune_run/{run_name}/"
+                ))
+        except KeyboardInterrupt:
+            self.root.after(0, lambda: self.status_var.set("Fine-tune cancelled."))
+        except Exception as e:
+            tb = traceback.format_exc()
+            error_log.parent.mkdir(parents=True, exist_ok=True)
+            with error_log.open("a") as f:
+                f.write(f"\n--- {ts} ---\n{tb}\n")
+            msg = str(e)
+            self.root.after(0, lambda: self.status_var.set(
+                f"Fine-tuning error: {msg} (see {error_log.name})"
+            ))
+        finally:
+            def _reset():
+                self._finetuning = False
+                self.ft_progress.pack_forget()
+                self.lbl_ft_epoch.pack_forget()
+                self.btn_cancel_ft.pack_forget()
+                self.btn_cancel_ft.configure(state=tk.NORMAL)
+                self._update_finetune_button()
+                self.btn_finetune.configure(text=FINETUNE_BTN_LABEL)
+            self.root.after(0, _reset)
+
+    # -------------------------------------------------------------------
+    # Refresh (restart live camera)
+    # -------------------------------------------------------------------
+    def _refresh(self):
+        self.status_var.set("Refreshing camera...")
+        self.root.update()
+        if self.running:
+            self._stop_live()
+        self._start_live()
+
+    # -------------------------------------------------------------------
+    # Save detection result
+    # -------------------------------------------------------------------
+    def _make_report_image(self, annotated_bgr, detections):
+        """Return annotated frame + a dark stats/legend panel appended below."""
+        stats = compute_stats(detections)
+        h, w = annotated_bgr.shape[:2]
+        panel_h = 90
+
+        out = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
+        out[:h] = annotated_bgr
+        out[h:] = (28, 28, 28)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # ---- Legend row ----
+        y_leg = h + 28
+        cv2.rectangle(out, (14, y_leg - 14), (30, y_leg + 4), (0, 200, 0), -1)
+        cv2.putText(out, "Black Pepper", (36, y_leg), font, 0.48,
+                    (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.rectangle(out, (170, y_leg - 14), (186, y_leg + 4), (0, 0, 255), -1)
+        cv2.putText(out, "Papaya Seed (Adulterant)", (192, y_leg), font, 0.48,
+                    (200, 200, 200), 1, cv2.LINE_AA)
+
+        # ---- Stats row ----
+        y_stat = h + 66
+        items = [
+            f"Total Seeds: {stats['total_count']}",
+            f"Pepper: {stats['pepper_count']}",
+            f"Adulterant: {stats['adulterant_count']}",
+            f"Adulterant %: {stats['adulterant_pct']:.1f}%",
+        ]
+        col_w = w // len(items)
+        for i, text in enumerate(items):
+            color = (0, 200, 0) if i == 1 else ((0, 80, 255) if i == 2 else
+                    ((0, 200, 255) if i == 3 else (220, 220, 220)))
+            cv2.putText(out, text, (14 + i * col_w, y_stat), font, 0.52,
+                        color, 1, cv2.LINE_AA)
+
+        return out
+
+    def _save_result(self):
+        if self._last_annotated is None:
+            return
+        captures_dir = MODEL_DIR / "captures"
+        captures_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = captures_dir / f"detection_{timestamp}.jpg"
+        report = self._make_report_image(self._last_annotated, self._last_detections or [])
+        cv2.imwrite(str(filename), report, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        self.status_var.set(f"Saved: {filename.name}")
+
+    # -------------------------------------------------------------------
+    # Cleanup
+    # -------------------------------------------------------------------
+    def on_close(self):
+        if self.running:
+            self._stop_live()
+        self.root.destroy()
+
+    def _shutdown(self):
+        if self._finetuning:
+            messagebox.showwarning(
+                "Shutdown blocked",
+                "Fine-tuning is in progress. Cancel it before shutting down.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Shutdown", "Power off the system now?"
+        ):
+            return
+        if self.running:
+            self._stop_live()
+        try:
+            subprocess.Popen(["sudo", "-n", "shutdown", "-h", "now"])
+        except Exception as e:
+            messagebox.showerror("Shutdown failed", str(e))
+            return
+        self.root.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
+def main():
+    root = tk.Tk()
+    root.attributes("-fullscreen", True)
+    root.lift()
+    root.attributes("-topmost", True)  # force focus on LXDE/Wayfire (Pi-specific)
+    root.after_idle(lambda: root.attributes("-topmost", False))
+    app = DetectorApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
